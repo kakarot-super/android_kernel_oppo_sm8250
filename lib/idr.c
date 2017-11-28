@@ -33,6 +33,7 @@ DEFINE_PER_CPU(struct ida_bitmap *, ida_bitmap);
  */
 int idr_alloc_u32(struct idr *idr, void *ptr, u32 *nextid,
 			unsigned long max, gfp_t gfp)
+
 {
 	struct radix_tree_iter iter;
 	void __rcu **slot;
