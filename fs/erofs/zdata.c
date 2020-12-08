@@ -1123,27 +1123,20 @@ repeat:
 	put_page(page);
 out_allocpage:
 	page = erofs_allocpage(pagepool, gfp | __GFP_NOFAIL);
-	if (!tocache || add_to_page_cache_lru(page, mc, index + nr, gfp)) {
-		/* turn into temporary page if fails */
-		set_page_private(page, Z_EROFS_SHORTLIVED_PAGE);
-		tocache = false;
-	}
-
 	if (oldpage != cmpxchg(&pcl->compressed_pages[nr], oldpage, page)) {
 		list_add(&page->lru, pagepool);
-		cpu_relax();
+		cond_resched();
 		goto repeat;
 	}
-	if (nocache || !tocache)
-		goto out;
-out_to_managed_cache:
-	if (add_to_page_cache_lru(page, mc, index + nr, gfp)) {
-		page->mapping = Z_EROFS_MAPPING_STAGING;
+
+	if (!tocache || add_to_page_cache_lru(page, mc, index + nr, gfp)) {
+		/* turn into temporary page if fails (1 ref) */
+		set_page_private(page, Z_EROFS_SHORTLIVED_PAGE);
 		goto out;
 	}
-
 	set_page_private(page, (unsigned long)pcl);
 	SetPagePrivate(page);
+
 out:	/* the only exit (for tracing and debugging) */
 	return page;
 }
