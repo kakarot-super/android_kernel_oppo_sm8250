@@ -21,8 +21,11 @@
 enum z_erofs_cache_alloctype {
 	DONTALLOC,	/* don't allocate any cached pages */
 	DELAYEDALLOC,	/* delayed allocation (at the time of submitting io) */
-	TRYALLOC,	/* try to allocate or do in-place approach otherwise */
-			/* to prevent causing direct reclaim */
+	/*
+	 * try to use cached I/O if page allocation succeeds or fallback
+	 * to in-place I/O instead to avoid any direct reclaim.
+	 */
+	TRYALLOC,
 };
 
 /*
@@ -174,7 +177,8 @@ static void preload_compressed_pages(struct z_erofs_collector *clt,
 	struct page **pages = clt->compressedpages;
 	pgoff_t index = pcl->obj.index + (pages - pcl->compressed_pages);
 	bool standalone = true;
-	gfp_t gfp = mapping_gfp_constraint(mc, GFP_KERNEL) & ~__GFP_DIRECT_RECLAIM;
+	gfp_t gfp = (mapping_gfp_mask(mc) & ~__GFP_DIRECT_RECLAIM) |
+			__GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN;
 
 	if (clt->mode < COLLECT_PRIMARY_FOLLOWED)
 		return;
@@ -195,20 +199,14 @@ static void preload_compressed_pages(struct z_erofs_collector *clt,
 		} else if (type == DELAYEDALLOC) {
 			t = tagptr_init(compressed_page_t, PAGE_UNALLOCATED);
 		} else if (type == TRYALLOC) {
-			gfp |= __GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN;
-
-			if (!list_empty(pagepool)) {
-				newpage = lru_to_page(pagepool);
-				list_del(&newpage->lru);
-			} else {
-				newpage = alloc_page(gfp);
-			}
+			newpage = erofs_allocpage(pagepool, gfp);
 			if (!newpage)
-				goto fallback_dontalloc;
-			newpage->mapping = Z_EROFS_MAPPING_PREALLOCATED;
+				goto dontalloc;
+
+			set_page_private(newpage, Z_EROFS_PREALLOCATED_PAGE);
 			t = tag_compressed_page_justfound(newpage);
 		} else {	/* DONTALLOC */
-fallback_dontalloc:
+dontalloc:
 			if (standalone)
 				clt->compressedpages = pages;
 			standalone = false;
@@ -221,7 +219,7 @@ fallback_dontalloc:
 		if (page) {
 			put_page(page);
 		} else if (newpage) {
-			newpage->mapping = NULL;
+			set_page_private(newpage, 0);
 			list_add(&newpage->lru, pagepool);
 		}
 	}
@@ -585,8 +583,7 @@ static bool should_alloc_managed_pages(struct z_erofs_decompress_frontend *fe,
 }
 
 static int z_erofs_do_read_page(struct z_erofs_decompress_frontend *fe,
-				struct page *page,
-				struct list_head *pagepool)
+				struct page *page, struct list_head *pagepool)
 {
 	struct inode *const inode = fe->inode;
 	struct erofs_sb_info *const sbi __maybe_unused = EROFS_I_SB(inode);
@@ -639,11 +636,7 @@ restart_now:
 
 	/* preload all compressed pages (maybe downgrade role if necessary) */
 	if (should_alloc_managed_pages(fe, sbi->cache_strategy, map->m_la))
-#if defined(CONFIG_OPLUS_FEATURE_EROFS)
 		cache_strategy = TRYALLOC;
-#else
-		cache_strategy = DELAYEDALLOC;
-#endif
 	else
 		cache_strategy = DONTALLOC;
 
@@ -1063,6 +1056,16 @@ repeat:
 	justfound = tagptr_unfold_tags(t);
 	page = tagptr_unfold_ptr(t);
 
+	/*
+	 * preallocated cached pages, which is used to avoid direct reclaim
+	 * otherwise, it will go inplace I/O path instead.
+	 */
+	if (page->private == Z_EROFS_PREALLOCATED_PAGE) {
+		WRITE_ONCE(pcl->compressed_pages[nr], page);
+		set_page_private(page, 0);
+		tocache = true;
+		goto out_tocache;
+	}
 	mapping = READ_ONCE(page->mapping);
 
 	/*
@@ -1125,7 +1128,7 @@ out_allocpage:
 		cond_resched();
 		goto repeat;
 	}
-
+out_tocache:
 	if (!tocache || add_to_page_cache_lru(page, mc, index + nr, gfp)) {
 		/* turn into temporary page if fails (1 ref) */
 		set_page_private(page, Z_EROFS_SHORTLIVED_PAGE);
