@@ -715,7 +715,9 @@ err_out:
 	goto out;
 }
 
-static void z_erofs_vle_unzip_kickoff(void *ptr, int bios)
+static void z_erofs_decompressqueue_work(struct work_struct *work);
+static void z_erofs_decompress_kickoff(struct z_erofs_decompressqueue *io,
+				       bool sync, int bios)
 {
 	tagptr1_t t = tagptr_init(tagptr1_t, ptr);
 	struct z_erofs_unzip_io *io = tagptr_unfold_ptr(t);
@@ -731,16 +733,14 @@ static void z_erofs_vle_unzip_kickoff(void *ptr, int bios)
 		return;
 	}
 
-	if (!atomic_add_return(bios, &io->pending_bios)){
-#if defined(CONFIG_OPLUS_FEATURE_EROFS) && defined(CONFIG_PREEMPT_COUNT)
-	if (in_atomic() || irqs_disabled())
+	if (atomic_add_return(bios, &io->pending_bios))
+		return;
+	/* Use workqueue decompression for atomic contexts only */
+	if (in_atomic() || irqs_disabled()) {
 		queue_work(z_erofs_workqueue, &io->u.work);
-	else
-		z_erofs_vle_unzip_wq(&io->u.work);
-#else
-		queue_work(z_erofs_workqueue, &io->u.work);
-#endif
+		return;
 	}
+	z_erofs_decompressqueue_work(&io->u.work);
 }
 
 static bool z_erofs_page_is_invalidated(struct page *page)
