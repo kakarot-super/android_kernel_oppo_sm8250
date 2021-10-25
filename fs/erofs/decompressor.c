@@ -177,16 +177,10 @@ static int z_erofs_lz4_decompress(struct z_erofs_decompress_req *rq, u8 *out)
     }
 #endif
 
-    if (ret < 0) {
-        erofs_err(rq->sb, "failed to decompress, in[%u, %u] out[%u]",
-              inlen, inputmargin, rq->outputsize);
-        WARN_ON(1);
-        print_hex_dump(KERN_DEBUG, "[ in]: ", DUMP_PREFIX_OFFSET,
-                   16, 1, src + inputmargin, inlen, true);
-        print_hex_dump(KERN_DEBUG, "[out]: ", DUMP_PREFIX_OFFSET,
-                   16, 1, out, rq->outputsize, true);
-        ret = -EIO;
-    }
+		print_hex_dump(KERN_DEBUG, "[ in]: ", DUMP_PREFIX_OFFSET,
+			       16, 1, src + inputmargin, inlen, true);
+		print_hex_dump(KERN_DEBUG, "[out]: ", DUMP_PREFIX_OFFSET,
+			       16, 1, out, rq->outputsize, true);
 
     if (copied)
         erofs_put_pcpubuf(src);
