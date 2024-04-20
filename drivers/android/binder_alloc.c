@@ -24,6 +24,7 @@
 #include <linux/rbtree.h>
 #include <linux/seq_file.h>
 #include <linux/vmalloc.h>
+#include <linux/rekernel.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/list_lru.h>
@@ -368,39 +369,85 @@ static inline struct vm_area_struct *binder_alloc_get_vma(
 
 static void debug_low_async_space_locked(struct binder_alloc *alloc, int pid)
 {
-	/*
-	 * Find the amount and size of buffers allocated by the current caller;
-	 * The idea is that once we cross the threshold, whoever is responsible
-	 * for the low async space is likely to try to send another async txn,
-	 * and at some point we'll catch them in the act. This is more efficient
-	 * than keeping a map per pid.
-	 */
-	struct rb_node *n = alloc->free_buffers.rb_node;
-	struct binder_buffer *buffer;
-	size_t total_alloc_size = 0;
-	size_t num_buffers = 0;
+    /*
+     * Find the amount and size of buffers allocated by the current caller;
+     * The idea is that once we cross the threshold, whoever is responsible
+     * for the low async space is likely to try to send another async txn,
+     * and at some point we'll catch them in the act. This is more efficient
+     * than keeping a map per pid.
+     */
+    struct rb_node *n = alloc->free_buffers.rb_node;
+    struct binder_buffer *buffer;
+    size_t total_alloc_size = 0;
+    size_t num_buffers = 0;
 
-	for (n = rb_first(&alloc->allocated_buffers); n != NULL;
-		 n = rb_next(n)) {
-		buffer = rb_entry(n, struct binder_buffer, rb_node);
-		if (buffer->pid != pid)
-			continue;
-		if (!buffer->async_transaction)
-			continue;
-		total_alloc_size += binder_alloc_buffer_size(alloc, buffer)
-			+ sizeof(struct binder_buffer);
-		num_buffers++;
-	}
+    for (n = rb_first(&alloc->allocated_buffers); n != NULL;
+         n = rb_next(n)) {
+        buffer = rb_entry(n, struct binder_buffer, rb_node);
+        if (buffer->pid != pid)
+            continue;
+        if (!buffer->async_transaction)
+            continue;
+        total_alloc_size += binder_alloc_buffer_size(alloc, buffer)
+            + sizeof(struct binder_buffer);
+        num_buffers++;
+    }
 
-	/*
-	 * Warn if this pid has more than 50 transactions, or more than 50% of
-	 * async space (which is 25% of total buffer size).
-	 */
-	if (num_buffers > 50 || total_alloc_size > alloc->buffer_size / 4) {
-		binder_alloc_debug(BINDER_DEBUG_USER_ERROR,
-			     "%d: pid %d spamming oneway? %zd buffers allocated for a total size of %zd\n",
-			      alloc->pid, pid, num_buffers, total_alloc_size);
-	}
+    /*
+     * Warn if this pid has more than 50 transactions, or more than 50% of
+     * async space (which is 25% of total buffer size).
+     */
+    if (num_buffers > 50 || total_alloc_size > alloc->buffer_size / 4) {
+        binder_alloc_debug(BINDER_DEBUG_USER_ERROR,
+                   "%d: pid %d spamming oneway? %zd buffers allocated for a total size of %zd\n",
+                    alloc->pid, pid, num_buffers, total_alloc_size);
+    }
+}
+
+static inline bool line_is_frozen(struct task_struct *task)
+{
+    return frozen(task) || freezing(task);
+}
+
+static int send_netlink_message(char *msg, uint16_t len) {
+    struct sk_buff *skbuffer;
+    struct nlmsghdr *nlhdr;
+
+    skbuffer = nlmsg_new(len, GFP_ATOMIC);
+    if (!skbuffer) {
+        printk("netlink alloc failure.\n");
+        return -1;
+    }
+
+    nlhdr = nlmsg_put(skbuffer, 0, 0, rekernel_netlink_unit, len, 0);
+    if (!nlhdr) {
+        printk("nlmsg_put failaure.\n");
+        nlmsg_free(skbuffer);
+        return -1;
+    }
+
+    memcpy(nlmsg_data(nlhdr), msg, len);
+    return netlink_unicast(rekernel_netlink, skbuffer, REKERNEL_USER_PORT, MSG_DONTWAIT);
+}
+
+static int start_rekernel_server(void) {
+  extern struct net init_net;
+  struct netlink_kernel_cfg rekernel_cfg = { 
+    .input = NULL,
+  };
+  if (rekernel_netlink != NULL)
+    return 0;
+  for (rekernel_netlink_unit = NETLINK_REKERNEL_MIN; rekernel_netlink_unit < NETLINK_REKERNEL_MAX; rekernel_netlink_unit++) {
+    rekernel_netlink = (struct sock *)netlink_kernel_create(&init_net, rekernel_netlink_unit, &rekernel_cfg);
+    if (rekernel_netlink != NULL)
+      break;
+  }
+  printk("Created Re:Kernel server! NETLINK UNIT: %d\n", rekernel_netlink_unit);
+  if (rekernel_netlink == NULL) {
+    printk("Failed to create Re:Kernel server!\n");
+    return -1;
+  }
+  return 0;
 }
 
 static struct binder_buffer *binder_alloc_new_buf_locked(
@@ -411,6 +458,7 @@ static struct binder_buffer *binder_alloc_new_buf_locked(
 				int is_async,
 				int pid)
 {
+	struct task_struct *proc_task = NULL;
 	struct rb_node *n = alloc->free_buffers.rb_node;
 	struct binder_buffer *buffer;
 	size_t buffer_size;
@@ -447,17 +495,32 @@ static struct binder_buffer *binder_alloc_new_buf_locked(
 		return ERR_PTR(-EINVAL);
 	}
 #ifdef OPLUS_FEATURE_HANS_FREEZE
-	if (is_async
-		&& (alloc->free_async_space < 3 * (size + sizeof(struct binder_buffer))
-		|| (alloc->free_async_space < ((alloc->buffer_size / 2) * 9 / 10)))) {
-		rcu_read_lock();
-		p = find_task_by_vpid(alloc->pid);
-		rcu_read_unlock();
-		if (p != NULL && is_frozen_tg(p)) {
-			hans_report(ASYNC_BINDER, task_tgid_nr(current), task_uid(current).val, task_tgid_nr(p), task_uid(p).val, "free_buffer_full", -1);
-		}
-	}
+    if (is_async
+        && (alloc->free_async_space < 3 * (size + sizeof(struct binder_buffer))
+        || (alloc->free_async_space < ((alloc->buffer_size / 2) * 9 / 10)))) {
+        rcu_read_lock();
+        p = find_task_by_vpid(alloc->pid);
+        rcu_read_unlock();
+        if (p != NULL && is_frozen_tg(p)) {
+            hans_report(ASYNC_BINDER, task_tgid_nr(current), task_uid(current).val, task_tgid_nr(p), task_uid(p).val, "free_buffer_full", -1);
+        }
+    }
 #endif /*OPLUS_FEATURE_HANS_FREEZE*/
+
+    if (is_async
+        && (alloc->free_async_space < 3 * (size + sizeof(struct binder_buffer))
+        || (alloc->free_async_space < REKERNEL_WARN_AHEAD_SPACE))) {
+        rcu_read_lock();
+        proc_task = find_task_by_vpid(alloc->pid);
+        rcu_read_unlock();
+        if (proc_task != NULL && start_rekernel_server() == 0) {
+            if (line_is_frozen(proc_task)) {
+                char binder_kmsg[REKERNEL_PACKET_SIZE];
+                snprintf(binder_kmsg, sizeof(binder_kmsg), "type=Binder,bindertype=free_buffer_full,oneway=1,from_pid=%d,from=%d,target_pid=%d,target=%d;", current->pid, task_uid(current).val, proc_task->pid, task_uid(proc_task).val);
+                send_netlink_message(binder_kmsg, strlen(binder_kmsg));
+            }
+        }
+    }
 	if (is_async &&
 	    alloc->free_async_space < size + sizeof(struct binder_buffer)) {
 		binder_alloc_debug(BINDER_DEBUG_BUFFER_ALLOC,
