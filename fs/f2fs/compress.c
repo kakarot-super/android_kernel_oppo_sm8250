@@ -246,12 +246,55 @@ static int lz4_compress_pages(struct compress_ctx *cc)
 {
 	int len;
 
-	len = LZ4_compress_default(cc->rbuf, cc->cbuf->cdata, cc->rlen,
-						cc->clen, cc->private);
+	if (level)
+		len = LZ4_compress_HC(cc->rbuf, cc->cbuf->cdata, cc->rlen,
+					cc->clen, level, cc->private);
+	else
+		len = LZ4_compress_default(cc->rbuf, cc->cbuf->cdata, cc->rlen,
+						cc->clen);
 	if (!len)
 		return -EAGAIN;
 
 	cc->clen = len;
+	return 0;
+}
+#endif
+
+static int lz4_compress_pages(struct compress_ctx *cc)
+{
+	if (f2fs_compress_layout(cc->inode) == COMPRESS_FIXED_INPUT) {
+		int len;
+
+#ifdef CONFIG_F2FS_FS_LZ4HC
+		return lz4hc_compress_pages(cc);
+#endif
+
+		len = LZ4_compress_default(cc->rbuf, cc->cbuf->cdata, cc->rlen,
+						cc->clen);
+		if (!len)
+			return -EAGAIN;
+
+		cc->clen = len;
+#ifdef CONFIG_F2FS_FS_COMPRESSION_FIXED_OUTPUT
+	} else {
+		int slen = (cc->nr_rpages << PAGE_SHIFT) - cc->rofs;
+		void *src = cc->rbuf + cc->rofs;
+		void *dst = (void *)cc->cbuf + cc->cofs;
+		int dlen;
+
+		dlen = LZ4_compress_destSize(src, dst, &slen, PAGE_SIZE);
+		if (!dlen)
+			return -EAGAIN;
+
+		if (dlen != PAGE_SIZE && cc->rofs + slen != cc->nr_rpages << PAGE_SHIFT) {
+			dlen = round_up(dlen, PAGE_SIZE);
+		}
+
+		cc->rofs += slen;
+		cc->cofs += dlen;
+#endif
+	}
+
 	return 0;
 }
 
