@@ -114,92 +114,85 @@ static void *generic_copy_inplace_data(struct z_erofs_decompress_req *rq,
 	return tmp;
 }
 
-int z_erofs_lz4_decompress_partial(const char *in, char *out,
-				   unsigned int inlen, unsigned int outlen,
-				   bool accel, bool dip);
 static int z_erofs_lz4_decompress(struct z_erofs_decompress_req *rq, u8 *out)
 {
-	unsigned int inputmargin, inlen;
-	u8 *src;
-	bool copied, support_0padding;
-	int ret;
+    unsigned int inputmargin, inlen;
+    u8 *src;
+    bool copied, support_0padding;
+    int ret;
 
-	if (rq->inputsize > PAGE_SIZE)
-		return -EOPNOTSUPP;
+    if (rq->inputsize > PAGE_SIZE)
+        return -EOPNOTSUPP;
 
-	src = kmap_atomic(*rq->in);
-	inputmargin = 0;
-	support_0padding = false;
+    src = kmap_atomic(*rq->in);
+    inputmargin = 0;
+    support_0padding = false;
 
-	/* decompression inplace is only safe when 0padding is enabled */
-	if (EROFS_SB(rq->sb)->feature_incompat &
-	    EROFS_FEATURE_INCOMPAT_LZ4_0PADDING) {
-		support_0padding = true;
+    /* decompression inplace is only safe when 0padding is enabled */
+    if (EROFS_SB(rq->sb)->feature_incompat &
+        EROFS_FEATURE_INCOMPAT_LZ4_0PADDING) {
+        support_0padding = true;
 
-		while (!src[inputmargin & ~PAGE_MASK])
-			if (!(++inputmargin & ~PAGE_MASK))
-				break;
+        while (!src[inputmargin & ~PAGE_MASK])
+            if (!(++inputmargin & ~PAGE_MASK))
+                break;
 
-		if (inputmargin >= rq->inputsize) {
-			kunmap_atomic(src);
-			return -EIO;
-		}
-	}
+        if (inputmargin >= rq->inputsize) {
+            kunmap_atomic(src);
+            return -EIO;
+        }
+    }
 
-	rq->inputsize -= inputmargin;
-	src = z_erofs_handle_inplace_io(rq, headpage, dst, &inputmargin,
-					&maptype, support_0padding);
-	if (IS_ERR(src))
-		return PTR_ERR(src);
+    inlen = rq->inputsize - inputmargin;
+    copied = false;
 
-	out = dst + rq->pageofs_out;
-	/* legacy format could compress extra data in a pcluster. */
-	if (rq->partial_decoding || !support_0padding)
-		ret = LZ4_arm64_decompress_safe_partial(src + inputmargin, out,
-				rq->inputsize, rq->outputsize, rq->inplace_io);
-	else
-		ret = LZ4_arm64_decompress_safe(src + inputmargin, out,
-					  rq->inputsize, rq->outputsize, rq->inplace_io);
+    if (rq->inplace_io) {
+        const unsigned int oend = (rq->pageofs_out +
+                       rq->outputsize) & ~PAGE_MASK;
+        const unsigned int nr = PAGE_ALIGN(rq->pageofs_out +
+                       rq->outputsize) >> PAGE_SHIFT;
 
-	if (ret != rq->outputsize) {
-		erofs_err(rq->sb, "failed to decompress %d in[%u, %u] out[%u]",
-			  ret, rq->inputsize, inputmargin, rq->outputsize);
+        if (rq->partial_decoding || !support_0padding ||
+            rq->out[nr - 1] != rq->in[0] ||
+            rq->inputsize - oend <
+              LZ4_DECOMPRESS_INPLACE_MARGIN(inlen)) {
+            src = generic_copy_inplace_data(rq, src, inputmargin);
+            inputmargin = 0;
+            copied = true;
+        }
+    }
 
-		if (rq->partial_decoding || !support_0padding ||
-		    rq->out[nr - 1] != rq->in[0] ||
-		    rq->inputsize - oend <
-		      LZ4_DECOMPRESS_INPLACE_MARGIN(inlen)) {
-			src = generic_copy_inplace_data(rq, src, inputmargin);
-			inputmargin = 0;
-			copied = true;
-		}
-	}
 #ifdef CONFIG_OPLUS_FEATURE_EROFS
-	ret = z_erofs_lz4_decompress_partial(src + inputmargin, out,
-					inlen, rq->outputsize,
-					test_opt(EROFS_SB(rq->sb), LZ4ASM),
-					rq->inplace_io);
+    ret = z_erofs_lz4_decompress_partial(src + inputmargin, out,
+                       inlen, rq->outputsize,
+                       test_opt(EROFS_SB(rq->sb), LZ4ASM),
+                       rq->inplace_io);
 #else
-  	ret = LZ4_decompress_safe_partial(src + inputmargin, out,
-					  inlen, rq->outputsize,
-					  rq->outputsize);
+    if (rq->partial_decoding) {
+        ret = LZ4_arm64_decompress_safe_partial(src + inputmargin, out,
+                             inlen, rq->outputsize, rq->inplace_io);
+    } else {
+        ret = LZ4_arm64_decompress_safe(src + inputmargin, out,
+                             inlen, rq->outputsize, rq->inplace_io);
+    }
 #endif
-	if (ret < 0) {
-		erofs_err(rq->sb, "failed to decompress, in[%u, %u] out[%u]",
-			  inlen, inputmargin, rq->outputsize);
-		WARN_ON(1);
-		print_hex_dump(KERN_DEBUG, "[ in]: ", DUMP_PREFIX_OFFSET,
-			       16, 1, src + inputmargin, inlen, true);
-		print_hex_dump(KERN_DEBUG, "[out]: ", DUMP_PREFIX_OFFSET,
-			       16, 1, out, rq->outputsize, true);
-		ret = -EIO;
-	}
 
-	if (copied)
-		erofs_put_pcpubuf(src);
-	else
-		kunmap_atomic(src);
-	return ret;
+    if (ret < 0) {
+        erofs_err(rq->sb, "failed to decompress, in[%u, %u] out[%u]",
+              inlen, inputmargin, rq->outputsize);
+        WARN_ON(1);
+        print_hex_dump(KERN_DEBUG, "[ in]: ", DUMP_PREFIX_OFFSET,
+                   16, 1, src + inputmargin, inlen, true);
+        print_hex_dump(KERN_DEBUG, "[out]: ", DUMP_PREFIX_OFFSET,
+                   16, 1, out, rq->outputsize, true);
+        ret = -EIO;
+    }
+
+    if (copied)
+        erofs_put_pcpubuf(src);
+    else
+        kunmap_atomic(src);
+    return ret;
 }
 
 static struct z_erofs_decompressor decompressors[] = {
