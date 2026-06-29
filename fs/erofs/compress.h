@@ -83,4 +83,8 @@ static inline bool z_erofs_put_shortlivedpage(struct list_head *pagepool,
 int z_erofs_decompress(struct z_erofs_decompress_req *rq,
 		       struct list_head *pagepool);
 
+int z_erofs_lz4_decompress_partial(const char *in, char *out,
+				   unsigned int inlen, unsigned int outlen,
+				   bool accel, bool dip);
+
 #endif
