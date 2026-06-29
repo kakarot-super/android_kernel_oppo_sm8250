@@ -3372,7 +3372,6 @@ static int binder_proc_transaction(struct binder_transaction *t,
 
 	#if defined(OPLUS_FEATURE_SCHED_ASSIST)
 	struct task_struct *grp_leader = NULL;
-	struct task_struct *curr = current;
     #endif
 
 	BUG_ON(!node);
@@ -3797,8 +3796,8 @@ static void binder_transaction(struct binder_proc *proc,
          			send_netlink_message(binder_kmsg, strlen(binder_kmsg));
    			}
 		}
-		if (security_binder_transaction(proc->tsk,
-						target_proc->tsk) < 0) {
+		if (security_binder_transaction(proc->cred,
+						target_proc->cred) < 0) {
 			return_error = BR_FAILED_REPLY;
 			return_error_param = -EPERM;
 			return_error_line = __LINE__;
